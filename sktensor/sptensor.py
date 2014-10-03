@@ -15,18 +15,18 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import numpy as np
-from numpy import zeros, ones, array, arange, copy, ravel_multi_index, unravel_index
-from numpy import setdiff1d, hstack, hsplit, vsplit, sort, prod, lexsort, unique, bincount
-from scipy.sparse import coo_matrix
+from numpy import zeros, ones, array, arange, copy, ravel_multi_index
+from numpy import setdiff1d, hstack, hsplit, vsplit, sort, prod, lexsort
+from numpy import unravel_index, unique, bincount
+from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse import issparse as issparse_mat
 from sktensor.core import tensor_mixin
 from sktensor.utils import accum
-from sktensor.dtensor import unfolded_dtensor
+from sktensor.dtensor import unfolded_dtensor, dtensor
 from sktensor.pyutils import inherit_docstring_from, from_to_without
 
 
 __all__ = [
-    'concatenate',
     'fromarray',
     'sptensor',
     'unfolded_sptensor',
@@ -137,7 +137,7 @@ class sptensor(tensor_mixin):
         self.issorted = True
 
     def _ttm_compute(self, V, mode, transp):
-        Z = self.unfold(mode, transp=True).tocsr()
+        Z = self.unfold(mode, transp=False).tocsr().transpose()
         if transp:
             V = V.T
         Z = Z.dot(V.T)
@@ -174,9 +174,9 @@ class sptensor(tensor_mixin):
             return sptensor((usubs[nz],), c[nz], nshp)
 
         # Case 3: result is an array
-        return sptensor(nsubs, nvals, shape=nshp, accumfun=np.sum)
+        return sptensor(nsubs, nvals, shape=nshp, accumfun=None)
 
-    def _ttm_me_compute(self, V, edims, sdims, transp):
+    def _ttm_me_compute_(self, V, edims, sdims, transp):
         """
         Assume Y = T x_i V_i for i = 1...n can fit into memory
         """
@@ -194,6 +194,74 @@ class sptensor(tensor_mixin):
         for i in range(np.prod(shapeY[edims])):
             rsubs = unravel_index(shapeY[edims], i)
 
+    def ttm_me(self, U, edims, sdims, transp=False):
+        """
+        Assume Y = T x_i V_i for i = 1...n can fit into memory
+
+        Parameters
+        ----------
+          U : list of matrices
+          edims : are the dimensions that are calculated in a more memory efficient elementwise way
+          sdims : are the dimensions that are calculated in the standard way
+        """
+
+        # Set number of dimensions of X
+        if self.ndim != len(U):
+            raise Exception('Incorrect number of elements in U')
+
+        # Determine size of Y (final result)
+        shapeY = np.copy(self.shape)
+        for n in np.union1d(edims, sdims):
+            shapeY[n] = U[n].shape[1] if transp else U[n].shape[0]
+
+        # Allocate space for Y (final result)
+        Y = np.zeros(shapeY)
+
+        # set up list of vectors for elementwise computation
+        v = []
+        M = []
+
+        # Set up mapping from sdims on X to appropriate dimensions on Z
+        zmap = -1 * ones((self.ndim,), dtype=np.int)
+        j = 0
+        for i in range(self.ndim):
+            if i not in edims:
+                zmap[i] = j
+                M.append(U[i])
+                j = j+1
+
+        zdims = zmap[sdims]
+
+        ### Main Loop
+        for i in arange(np.prod(shapeY[edims])):
+            # Get the subscripts of the rows to be extracted
+            rsubs = unravel_index(shapeY[edims], i)
+            v = [U[edims[j]][:, rsubs[j]] if transp else U[edims[j]][rsubs[j], :] for j in range(len(edims))]
+            ## Extract the appropiate rows of the U matrices
+            #for j in range(len(edims)):
+            #    if transp:
+            #        v.append(U[edims[j]][:, rsubs[j]])
+            #    else:
+            #        v.append(U[edims[j]][rsubs[j], :].T)
+
+            # Create argument to pass into tensor/subasgn
+            rsubarg = __makesubarg(self.ndim, edims, rsubs)
+
+            # Assign to appropiate part of Y
+            if len(zdims) == 0:
+                # Case 1: Assigning a single element of Y
+                t1 = self.ttv(v, edims)
+                Y = __subsasgn(Y, rsubarg, t1)
+            else:
+                # Case 2: Assigning an entire subtensor
+                Z = self.ttv(v, edims)
+
+                # Assignment of values only needed if Z has nonzero values.
+                if isinstance(dtensor, Z) or Z.nnz() > 0:
+                    tmp = Z.ttm(M, zdims, transp)
+                    Y = __subsasgn(Y, rsubarg, tmp)
+        return Y
+
     def unfold(self, rdims, cdims=None, transp=False):
         if isinstance(rdims, type(1)):
             rdims = [rdims]
@@ -207,8 +275,8 @@ class sptensor(tensor_mixin):
                 'Incorrect specification of dimensions (rdims: %s, cdims: %s)'
                 % (str(rdims), str(cdims))
             )
-        M = prod([self.shape[r] for r in rdims])
-        N = prod([self.shape[c] for c in cdims])
+        M = np.prod([self.shape[r] for r in rdims],dtype=np.int64)
+        N = np.prod([self.shape[c] for c in cdims],dtype=np.int64)
         ridx = _build_idx(self.subs, self.vals, rdims, self.shape)
         cidx = _build_idx(self.subs, self.vals, cdims, self.shape)
         return unfolded_sptensor((self.vals, (ridx, cidx)), (M, N), rdims, cdims, self.shape)
@@ -257,9 +325,9 @@ class sptensor(tensor_mixin):
 
         Parameters
         ----------
-        tpl :  tuple of sparse tensors
+        tpl : tuple of sparse tensors
             Tensors to be concatenated.
-        axis :  int, optional
+        axis : int, optional
             Axis along which concatenation should take place
         """
         if axis is None:
@@ -280,6 +348,17 @@ class sptensor(tensor_mixin):
         [Kolda and Bader, 2009; p.457]
         """
         return np.linalg.norm(self.vals)
+
+    def nnz(self):
+        """
+        Number of nonzero entries in a sparse tensor
+
+        Returns
+        -------
+        nnz : int
+            Number of nonzero entries
+        """
+        return len(self.vals)
 
     def toarray(self):
         A = zeros(self.shape)
